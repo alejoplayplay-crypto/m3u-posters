@@ -13,7 +13,14 @@ TMDB_URL = "https://api.themoviedb.org/3/search/movie"
 @app.route("/")
 def home():
     return "M3U Posters funcionando"
-
+@app.route("/test")
+def test():
+    poster = buscar_poster("Superman")
+    
+    if poster:
+        return poster
+    
+    return "TMDB no respondió o no encontró la película", 500
 def buscar_poster(titulo):
     if not TMDB_TOKEN:
         return None
