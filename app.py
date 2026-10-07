@@ -2,12 +2,16 @@ from flask import Flask, request, Response
 import os
 import requests
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
 TMDB_TOKEN = os.environ.get("TMDB_API_TOKEN")
 TMDB_URL = "https://api.themoviedb.org/3/search/movie"
+
+# Cantidad de búsquedas simultáneas
+MAX_WORKERS = 8
+
 
 # -------------------------------------------------
 # BUSCAR PÓSTER EN TMDB
@@ -18,10 +22,12 @@ def buscar_poster(titulo):
     if not TMDB_TOKEN:
         return None
 
+    titulo_original = titulo
+
     # Limpiar título
     titulo = re.sub(r"\s+", " ", titulo).strip()
 
-    # Quitar información que normalmente no pertenece al título
+    # Quitar año
     titulo = re.sub(
         r"\b(19|20)\d{2}\b",
         "",
@@ -29,6 +35,7 @@ def buscar_poster(titulo):
         flags=re.IGNORECASE
     )
 
+    # Quitar etiquetas habituales
     titulo = re.sub(
         r"\b(HD|FHD|4K|UHD|SD|FULL HD|LATINO|CASTELLANO|ESPAÑOL|SUB|SUBTITULADO)\b",
         "",
@@ -38,6 +45,9 @@ def buscar_poster(titulo):
 
     titulo = re.sub(r"[\[\]\(\)\{\}]", " ", titulo)
     titulo = re.sub(r"\s+", " ", titulo).strip()
+
+    if not titulo:
+        titulo = titulo_original
 
     headers = {
         "Authorization": f"Bearer {TMDB_TOKEN}",
@@ -56,7 +66,7 @@ def buscar_poster(titulo):
             TMDB_URL,
             headers=headers,
             params=params,
-            timeout=15
+            timeout=8
         )
 
         if r.status_code != 200:
@@ -64,10 +74,6 @@ def buscar_poster(titulo):
 
         resultados = r.json().get("results", [])
 
-        if not resultados:
-            return None
-
-        # Buscar el primer resultado que tenga póster
         for pelicula in resultados:
 
             poster = pelicula.get("poster_path")
@@ -131,21 +137,18 @@ def procesar():
             mimetype="text/plain"
         )
 
+    # ---------------------------------------------
+    # DESCARGAR M3U
+    # ---------------------------------------------
+
     try:
 
         respuesta = requests.get(
             m3u_url,
-            timeout=60
+            timeout=30
         )
 
-        if respuesta.status_code != 200:
-
-            return Response(
-                "No se pudo descargar el M3U. HTTP "
-                + str(respuesta.status_code),
-                status=500,
-                mimetype="text/plain"
-            )
+        respuesta.raise_for_status()
 
         contenido = respuesta.text
 
@@ -159,43 +162,102 @@ def procesar():
 
     lineas = contenido.splitlines()
 
-    salida = []
+    # ---------------------------------------------
+    # ENCONTRAR PELÍCULAS
+    # ---------------------------------------------
+
+    trabajos = {}
+
+    for i, linea in enumerate(lineas):
+
+        if not linea.startswith("#EXTINF"):
+            continue
+
+        # Si ya tiene logo, no tocar
+        if "tvg-logo=" in linea:
+            continue
+
+        partes = linea.split(",", 1)
+
+        if len(partes) != 2:
+            continue
+
+        titulo = partes[1].strip()
+
+        if not titulo:
+            continue
+
+        # Guardar títulos únicos.
+        # Si una película aparece varias veces,
+        # solo consultamos TMDB una vez.
+        if titulo not in trabajos:
+            trabajos[titulo] = []
+
+        trabajos[titulo].append(i)
+
+    # ---------------------------------------------
+    # BUSCAR PÓSTERS EN PARALELO
+    # ---------------------------------------------
+
+    posters = {}
+
+    titulos = list(trabajos.keys())
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
+        futuros = {
+            executor.submit(buscar_poster, titulo): titulo
+            for titulo in titulos
+        }
+
+        for futuro in as_completed(futuros):
+
+            titulo = futuros[futuro]
+
+            try:
+
+                poster = futuro.result()
+
+                if poster:
+                    posters[titulo] = poster
+
+            except Exception:
+                pass
+
+    # ---------------------------------------------
+    # CONSTRUIR M3U FINAL
+    # ---------------------------------------------
+
+    salida = list(lineas)
 
     peliculas_procesadas = 0
     posters_encontrados = 0
 
-    for linea in lineas:
+    for titulo, indices in trabajos.items():
 
-        # Solo procesar líneas EXTINF
-        if linea.startswith("#EXTINF"):
+        peliculas_procesadas += 1
 
-            # Si ya tiene logo, no modificar
-            if "tvg-logo=" not in linea:
+        poster = posters.get(titulo)
 
-                partes = linea.split(",", 1)
+        if not poster:
+            continue
 
-                if len(partes) == 2:
+        for indice in indices:
 
-                    titulo = partes[1].strip()
+            linea = salida[indice]
 
-                    peliculas_procesadas += 1
+            # Agregar tvg-logo después de #EXTINF:-1
+            nueva_linea = linea.replace(
+                "#EXTINF:-1",
+                '#EXTINF:-1 tvg-logo="' + poster + '"',
+                1
+            )
 
-                    poster = buscar_poster(titulo)
+            salida[indice] = nueva_linea
 
-                    if poster:
-
-                        linea = linea.replace(
-                            "#EXTINF:-1",
-                            '#EXTINF:-1 tvg-logo="' + poster + '"',
-                            1
-                        )
-
-                        posters_encontrados += 1
-
-                    # Pequeña pausa para no saturar TMDB
-                    time.sleep(0.05)
-
-        salida.append(linea)
+            posters_encontrados += 1
 
     resultado = "\n".join(salida)
 
@@ -205,8 +267,10 @@ def procesar():
         headers={
             "Content-Disposition":
                 "inline; filename=lista_con_posters.m3u",
+
             "X-Peliculas-Procesadas":
                 str(peliculas_procesadas),
+
             "X-Posters-Encontrados":
                 str(posters_encontrados)
         }
@@ -226,4 +290,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port
-    )
+        )
